@@ -122,10 +122,13 @@ ditandatangani, versi itu tidak dapat didaftarkan lagi.
 
 ## Versi workflow ini
 
-Panggil `@v1`. Perbaikan yang tidak mengubah cara memanggilnya masuk ke `v1`
-dan langsung dipakai setiap produk pada rilis berikutnya, tanpa perubahan di
-repo produk. Perubahan yang menuntut penyesuaian di repo produk terbit sebagai
-`v2`.
+Panggil `@v1`. `v1` adalah cabang: perbaikan masuk ke `main`, lalu `v1`
+dimajukan ke sana sesudah CI hijau. Perbaikan yang tidak mengubah cara
+memanggilnya langsung dipakai setiap produk pada rilis berikutnya, tanpa
+perubahan di repo produk. Perubahan yang menuntut penyesuaian di repo produk
+terbit sebagai `v2`.
+
+Jangan memanggil `@main`: isinya belum tentu sudah dimajukan ke `v1`.
 
 ## Mengembangkan repo ini
 

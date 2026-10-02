@@ -34,6 +34,10 @@
 #
 # Karena itu repo produk tidak butuh runner sendiri, tidak butuh akses ke
 # jaringan GONSU, dan hanya menyimpan satu secret: token dorong registry.
+#
+# `v1` adalah cabang. Perubahan masuk ke `main` lebih dulu, lalu `v1` dimajukan
+# ke sana sesudah CI hijau; perubahan di sini langsung dipakai setiap produk
+# pada rilis berikutnya.
 
 name: Release
 
