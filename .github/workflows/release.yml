@@ -1,0 +1,423 @@
+# Pipeline rilis produk GONSU One. Dipanggil dari repo produk, bukan dijalankan
+# di sini:
+#
+#   jobs:
+#     release:
+#       permissions:
+#         contents: read
+#         id-token: write
+#       uses: gonsutrijayautama/gonsu-release/.github/workflows/release.yml@v1
+#       with:
+#         product_code: garment
+#         variant_code: web
+#         image_path: products/garment-web
+#       secrets:
+#         registry_token: ${{ secrets.GONSU_REGISTRY_CI_TOKEN }}
+#
+# ---------------------------------------------------------------------------
+# YANG DILAKUKAN, DAN URUTANNYA MENENTUKAN
+# ---------------------------------------------------------------------------
+#
+#   1. build      image produk, dari commit yang ditandai tag
+#   2. push       ke registry GONSU, dengan token dorong dari GONSU
+#   3. scan       trivy, laporan LENGKAP disimpan sebagai bukti
+#   4. register   image, laporan, dan bukti asal job dikirim ke GONSU
+#   5. tunggu     GONSU memeriksa bukti itu sendiri, lalu menandatangani
+#   6. publish    ditolak bila tanda tangan atau pemindaian tidak lolos
+#
+# Pipeline ini TIDAK memegang kunci penandatangan dan tidak dapat memintanya.
+# Yang dibawanya hanyalah bukti dari GitHub tentang siapa dirinya: repository
+# mana, tag apa, commit mana. GONSU menandatangani bila bukti itu cocok dengan
+# rilis yang didaftarkan — repository yang terikat ke produknya, tag yang sama
+# dengan versinya, commit yang sama dengan asalnya, dan image serta laporan
+# pemindaian yang persis ini.
+#
+# Karena itu repo produk tidak butuh runner sendiri, tidak butuh akses ke
+# jaringan GONSU, dan hanya menyimpan satu secret: token dorong registry.
+
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      product_code:
+        description: Kode produk, sama dengan di Console GONSU.
+        required: true
+        type: string
+      variant_code:
+        description: Kode variant, sama dengan di Console GONSU.
+        required: true
+        type: string
+      image_path:
+        description: >-
+          Repository image di registry GONSU, misalnya products/garment-web.
+          Rilis pertama mengikatnya ke produk/variant; rilis berikutnya harus
+          mendarat di repository yang sama.
+        required: true
+        type: string
+      context:
+        description: Konteks build docker, relatif terhadap akar repo.
+        required: false
+        type: string
+        default: "."
+      dockerfile:
+        description: Letak Dockerfile. Kosong berarti Dockerfile di dalam konteks.
+        required: false
+        type: string
+        default: ""
+      api_url:
+        description: Alamat API GONSU. Diisi hanya untuk platform selain gonsu.cloud.
+        required: false
+        type: string
+        default: https://api.gonsu.cloud
+      registry_host:
+        description: Alamat registry GONSU. Diisi hanya untuk platform selain gonsu.cloud.
+        required: false
+        type: string
+        default: registry.gonsu.cloud
+    secrets:
+      registry_token:
+        description: >-
+          Sandi `docker login` sebagai `gonsu-ci`. Hanya memberi pull,push pada
+          repository produk.
+        required: true
+
+permissions: {}
+
+env:
+  TRIVY_VERSION: "0.74.0"
+  # sha256 trivy_<versi>_Linux-64bit.tar.gz. Dipatok di sini, bukan dibaca dari
+  # checksums.txt rilis yang sama: pihak yang dapat mengganti arsipnya dapat
+  # mengganti checksum-nya juga.
+  TRIVY_SHA256: "2ae6fe3ee734b7fdf11335663e18c75ea12dccc76062f09f164a3b0f8be4371a"
+
+jobs:
+  release:
+    name: Rilis
+    # Runner GitHub, VM sekali pakai. GONSU mencatat jenis runner dari bukti
+    # yang dibawa job ini.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      # Untuk meminta bukti asal job dari GitHub. Pemanggil harus memberi izin
+      # yang sama; workflow yang dipanggil tidak dapat menaikkan izinnya sendiri.
+      id-token: write
+    steps:
+      - name: Menentukan versi dari tag
+        id: version
+        run: |
+          # Rilis lahir dari keputusan menandai sebuah commit. GONSU menolak
+          # bukti yang pemicunya bukan tag; berhenti di sini menghemat satu
+          # build yang pasti ditolak.
+          [ "$GITHUB_REF_TYPE" = "tag" ] || {
+            echo "::error::Rilis hanya dijalankan dari tag, bukan dari $GITHUB_REF_TYPE $GITHUB_REF_NAME."
+            exit 1
+          }
+
+          # Bentuk tag DIPERIKSA sebelum nilainya dipakai di mana pun. Nama tag
+          # ditentukan siapa pun yang boleh mendorong tag, dan git mengizinkan
+          # kutip di dalam nama ref. Daftar-putih semver menutup seluruh kelas
+          # itu sekaligus, bukan satu karakter per satu karakter.
+          printf '%s' "$GITHUB_REF_NAME" \
+            | grep -qxE 'v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' || {
+              echo "::error::Tag $GITHUB_REF_NAME bukan vMAJOR.MINOR.PATCH semver murni."
+              exit 1
+            }
+
+          # Tag `v2.15.0` menjadi versi `2.15.0`. GONSU menyimpan semver murni;
+          # awalan `v` adalah kebiasaan git, bukan bagian versinya.
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Memeriksa masukan
+        # SELURUH nilai masuk lewat env, TIDAK satu pun lewat ${{ }} di dalam
+        # blok run — di langkah ini dan di semua langkah sesudahnya. Sintaks
+        # ${{ }} disubstitusi sebagai TEKS sebelum shell melihatnya, sehingga
+        # nilai yang ditulis orang lain berubah menjadi perintah.
+        env:
+          PRODUCT_CODE: ${{ inputs.product_code }}
+          VARIANT_CODE: ${{ inputs.variant_code }}
+          IMAGE_PATH: ${{ inputs.image_path }}
+          API_URL: ${{ inputs.api_url }}
+          REGISTRY_HOST: ${{ inputs.registry_host }}
+        run: |
+          check() {
+            printf '%s' "$2" | grep -qxE "$3" || {
+              echo "::error::Masukan $1 tidak sah: $2"
+              exit 1
+            }
+          }
+          check product_code "$PRODUCT_CODE" '[a-z0-9]+(-[a-z0-9]+)*'
+          check variant_code "$VARIANT_CODE" '[a-z0-9]+(-[a-z0-9]+)*'
+          # Tata bahasa jalur repository Docker, sama dengan yang diperiksa GONSU.
+          check image_path "$IMAGE_PATH" '[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*(/[a-z0-9]+(([._]|__|-+)[a-z0-9]+)*)*'
+          check registry_host "$REGISTRY_HOST" '[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]+)?'
+          # Bukti asal job dikirim ke alamat ini; tanpa TLS ia terbaca di jalan.
+          check api_url "$API_URL" 'https://[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]+)?'
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Memasang trivy
+        run: |
+          # Checksum diperiksa sebelum diekstrak: laporan pemindai inilah yang
+          # akan ditandatangani GONSU, dan pemindai yang diganti di tengah jalan
+          # dapat melaporkan apa pun yang diinginkan penggantinya.
+          BASE="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}"
+          ARCHIVE="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          cd "$RUNNER_TEMP"
+          curl -sfLO --retry 3 "$BASE/$ARCHIVE"
+          echo "${TRIVY_SHA256}  ${ARCHIVE}" | sha256sum -c -
+
+          mkdir -p "$RUNNER_TEMP/bin"
+          tar -xzf "$ARCHIVE" -C "$RUNNER_TEMP/bin" trivy
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+          rm -f "$ARCHIVE"
+
+      - name: Masuk ke registry GONSU
+        # Sandi lewat stdin, bukan argumen: yang lewat argumen terbaca di
+        # daftar process.
+        env:
+          REGISTRY_TOKEN: ${{ secrets.registry_token }}
+          REGISTRY_HOST: ${{ inputs.registry_host }}
+        run: |
+          [ -n "$REGISTRY_TOKEN" ] || {
+            echo "::error::Secret registry_token kosong. Minta token dorong registry ke tim platform GONSU."
+            exit 1
+          }
+          printf '%s' "$REGISTRY_TOKEN" \
+            | docker login "$REGISTRY_HOST" -u gonsu-ci --password-stdin
+
+      - name: Membangun dan mendorong image
+        id: image
+        env:
+          REGISTRY_HOST: ${{ inputs.registry_host }}
+          IMAGE_PATH: ${{ inputs.image_path }}
+          BUILD_CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          VERSION: ${{ steps.version.outputs.version }}
+          # Tanpa lampiran provenance bawaan buildx: dengan lampiran itu yang
+          # terdorong adalah sebuah indeks, dan digest yang didaftarkan harus
+          # menunjuk image-nya sendiri.
+          BUILDX_NO_DEFAULT_ATTESTATIONS: "1"
+        run: |
+          IMAGE="$REGISTRY_HOST/$IMAGE_PATH"
+
+          # Label versi dan revisi membuat setiap tag menghasilkan digest
+          # sendiri, walau isi image-nya tidak berubah. GONSU menolak digest
+          # yang sudah terdaftar untuk rilis lain. $VERSION sudah lolos
+          # daftar-putih semver di langkah "Menentukan versi dari tag".
+          set -- --build-arg "VERSION=$VERSION" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -t "$IMAGE:$VERSION"
+          if [ -n "$DOCKERFILE" ]; then
+            set -- "$@" -f "$DOCKERFILE"
+          fi
+          docker build "$@" "$BUILD_CONTEXT"
+          docker push "$IMAGE:$VERSION"
+
+          # Digest dibaca SETELAH push: sebelum didorong, image lokal belum
+          # memiliki digest registry sama sekali.
+          DIGEST="$(docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$IMAGE:$VERSION" \
+            | grep -F "$IMAGE@" | head -n1 | cut -d@ -f2)"
+          printf '%s' "$DIGEST" | grep -qxE 'sha256:[0-9a-f]{64}' || {
+            echo "::error::Digest image tidak terbaca sesudah push."
+            exit 1
+          }
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+          echo "digest=$DIGEST" >> "$GITHUB_OUTPUT"
+
+      - name: Memindai kerentanan
+        env:
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          # Laporan LENGKAP yang dikirim, bukan kesimpulan. GONSU menghitung
+          # sendiri apa yang menghalangi, sehingga ambangnya dapat diubah tanpa
+          # memindai ulang apa pun.
+          trivy image --quiet --scanners vuln --format json \
+            --severity CRITICAL,HIGH,MEDIUM "$IMAGE@$DIGEST" > "$RUNNER_TEMP/scan.json"
+
+      - name: Mendaftarkan, menunggu tanda tangan, dan menerbitkan
+        id: register
+        shell: python
+        env:
+          API_URL: ${{ inputs.api_url }}
+          PRODUCT_CODE: ${{ inputs.product_code }}
+          VARIANT_CODE: ${{ inputs.variant_code }}
+          VERSION: ${{ steps.version.outputs.version }}
+          CHANGELOG: ${{ github.event.head_commit.message }}
+          IMAGE: ${{ steps.image.outputs.image }}
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          import base64
+          import hashlib
+          import json
+          import os
+          import sys
+          import time
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          env = os.environ
+          API = env["API_URL"].rstrip("/")
+          SCANNER = "trivy " + env["TRIVY_VERSION"]
+          # Berapa lama menunggu GONSU menandatangani, dan jeda antarpertanyaan.
+          # Dapat dipendekkan lewat env; hanya pengujian yang melakukannya.
+          SIGNING_TIMEOUT = float(env.get("GONSU_RELEASE_SIGNING_TIMEOUT", "600"))
+          POLL_INTERVAL = float(env.get("GONSU_RELEASE_POLL_INTERVAL", "5"))
+          # Bukti dari GitHub berlaku 300 detik. Yang dipakai untuk bertanya
+          # diganti jauh sebelum itu.
+          TOKEN_REUSE = 120.0
+
+
+          def fail(message):
+              print("::error::" + " ".join(str(message).split()))
+              sys.exit(1)
+
+
+          def github_proof(audience):
+              """Meminta bukti asal job ini kepada GitHub.
+
+              Buktinya pernyataan bertanda tangan GitHub: repository, tag, dan
+              commit yang sedang dijalankan. `audience` ikut ditandatangani.
+              """
+              url = env.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+              bearer = env.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+              if not url or not bearer:
+                  fail("Job ini tidak diizinkan meminta bukti asal dari GitHub. "
+                       "Beri `permissions: id-token: write` pada job pemanggil.")
+              request = urllib.request.Request(
+                  url + "&audience=" + urllib.parse.quote(audience, safe=""),
+                  headers={"Authorization": "bearer " + bearer})
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  token = json.load(response)["value"]
+              # Disamarkan sebelum dipakai: galat apa pun sesudah ini dapat
+              # mencetaknya ke log yang tersimpan berbulan-bulan.
+              print("::add-mask::" + token, flush=True)
+              return token
+
+
+          def call(method, path, token, body=None):
+              data = None if body is None else json.dumps(body).encode()
+              request = urllib.request.Request(API + path, data=data, method=method, headers={
+                  "Authorization": "Bearer " + token,
+                  "Content-Type": "application/json",
+                  "User-Agent": "gonsu-release",
+              })
+              try:
+                  with urllib.request.urlopen(request, timeout=60) as response:
+                      return response.status, json.load(response)
+              except urllib.error.HTTPError as error:
+                  text = error.read().decode("utf-8", "replace")
+                  try:
+                      return error.code, json.loads(text)
+                  except ValueError:
+                      return error.code, {"error": {"message": text[:1000]}}
+
+
+          def explain(payload):
+              """Menyusun jawaban penolakan GONSU menjadi satu baris."""
+              error = payload.get("error") or {}
+              parts = [error.get("message") or json.dumps(payload)[:1000]]
+              for detail in error.get("details") or []:
+                  parts.append("%s: %s" % (detail.get("field"), detail.get("message")))
+              if error.get("request_id"):
+                  parts.append("(request_id %s)" % error["request_id"])
+              return " ".join(parts)
+
+
+          with open(os.path.join(env["RUNNER_TEMP"], "scan.json"), "rb") as handle:
+              report = handle.read()
+          report_sha256 = hashlib.sha256(report).hexdigest()
+
+          # Audience mengikat bukti ke SATU image dan SATU laporan pemindaian.
+          # Bukti rilis lain, atau bukti yang sama dengan laporan yang ditukar,
+          # tidak cocok.
+          audience = "gonsu-release:%s:%s" % (env["DIGEST"], report_sha256)
+
+          # Status tanda tangan dan pemindaian TIDAK dikirim: GONSU yang
+          # memutuskannya dari bukti dan laporan ini.
+          status, payload = call("POST", "/internal/v1/releases", github_proof(audience), {
+              "product_code": env["PRODUCT_CODE"],
+              "variant_code": env["VARIANT_CODE"],
+              "version": env["VERSION"],
+              "channel": "stable",
+              "changelog": env.get("CHANGELOG", ""),
+              # Commit yang ditandai tag rilis ini: digest menjawab image mana,
+              # SHA menjawab kode mana.
+              "source_revision": env["GITHUB_SHA"],
+              "artifacts": [{
+                  "kind": "oci", "platform": "linux", "architecture": "amd64",
+                  "location": env["IMAGE"],
+                  "tag": env["VERSION"],
+                  "digest": env["DIGEST"],
+              }],
+              "scan_report": base64.b64encode(report).decode(),
+              "scanner": SCANNER,
+          })
+          if status != 201:
+              fail("Registrasi rilis ditolak GONSU (%s). %s" % (status, explain(payload)))
+          release_id = payload["id"]
+          print("Rilis %s terdaftar sebagai %s. Menunggu GONSU menandatangani." % (env["VERSION"], release_id))
+
+          path = "/internal/v1/releases/" + urllib.parse.quote(release_id, safe="")
+          token, fetched = "", 0.0
+
+
+          def proof():
+              """Bukti untuk bertanya dan menerbitkan; dipakai ulang sebentar."""
+              global token, fetched
+              if not token or time.monotonic() - fetched > TOKEN_REUSE:
+                  token, fetched = github_proof("gonsu-release"), time.monotonic()
+              return token
+
+
+          deadline = time.monotonic() + SIGNING_TIMEOUT
+          while True:
+              try:
+                  status, payload = call("GET", path, proof())
+              except (urllib.error.URLError, TimeoutError, ValueError) as error:
+                  # Jaringan yang tersendat bukan putusan. Rilisnya tetap
+                  # dikerjakan GONSU; pertanyaannya diulang.
+                  status, payload = 0, {"error": {"message": str(error)}}
+
+              signing = payload.get("signing") or {}
+              if status == 200 and signing.get("state") == "signed":
+                  break
+              if status == 200 and signing.get("state") == "failed":
+                  fail("GONSU menolak menandatangani rilis ini. %s Rilis tertinggal di `staged` "
+                       "dan tidak terlihat pelanggan. Perbaiki sebabnya, lalu jalankan ulang job ini."
+                       % signing.get("failure_reason", ""))
+              if status in (400, 401, 403, 404):
+                  fail("GONSU menolak pertanyaan tentang rilis ini (%s). %s" % (status, explain(payload)))
+              if time.monotonic() > deadline:
+                  fail("GONSU belum menandatangani rilis ini sesudah %d detik (jawaban terakhir %s: %s). "
+                       "Rilis tertinggal di `staged`; hubungi tim platform GONSU."
+                       % (SIGNING_TIMEOUT, status, explain(payload) if status != 200 else signing.get("state")))
+              time.sleep(POLL_INTERVAL)
+
+          for artifact in payload.get("artifacts") or []:
+              print("Artifact %s: tanda tangan %s, pemindaian %s." % (
+                  artifact.get("digest"), artifact.get("signature_status"), artifact.get("scan_status")))
+
+          # Gerbangnya milik GONSU. Kalau ada kerentanan yang menghalangi,
+          # langkah ini ditolak — dan rilisnya tertinggal di `staged`, terlihat
+          # staf GONSU tetapi tidak terlihat pelanggan.
+          status, payload = call("POST", path + "/status", proof(), {"status": "published"})
+          if status != 200:
+              fail("Publikasi ditolak GONSU (%s). Rilis tetap di status `staged`. %s" % (status, explain(payload)))
+
+          print("Rilis %s terbit." % env["VERSION"])
+          summary = env.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as handle:
+                  handle.write("### Rilis %s terbit\n\n" % env["VERSION"])
+                  handle.write("| | |\n|---|---|\n")
+                  handle.write("| Produk | `%s` / `%s` |\n" % (env["PRODUCT_CODE"], env["VARIANT_CODE"]))
+                  handle.write("| Image | `%s@%s` |\n" % (env["IMAGE"], env["DIGEST"]))
+                  handle.write("| Commit | `%s` |\n" % env["GITHUB_SHA"])
+                  handle.write("| Rilis di GONSU | `%s` |\n" % release_id)

@@ -1,0 +1,43 @@
+# CI gonsu-release.
+#
+# HANYA runner GitHub, tidak pernah self-hosted: repository ini publik, dan PR
+# dari fork dapat menjalankan kode di runner yang dipakainya.
+#
+# Yang TIDAK diuji di sini adalah rilis sungguhan: itu membutuhkan produk yang
+# terdaftar di GONSU dan sebuah tag. Yang diuji adalah bentuk workflow-nya dan
+# percakapan skrip registrasinya dengan GONSU.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Lint dan uji
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Image actionlint membawa shellcheck dan pyflakes, sehingga skrip shell
+      # dan skrip python di dalam workflow ikut diperiksa, bukan hanya YAML-nya.
+      # Dipatok ke digest: tag dapat dipindahkan.
+      - name: actionlint
+        run: |
+          docker run --rm -v "$PWD":/repo -w /repo \
+            rhysd/actionlint@sha256:b1934ee5f1c509618f2508e6eb47ee0d3520686341fec936f3b79331f9315667 \
+            -color
+
+      - name: Uji skrip registrasi
+        run: python3 -m unittest discover -s tests -v
