@@ -1,0 +1,86 @@
+# Uji penolakan. Platform GONSU hanya menandatangani rilis yang dijalankan
+# release.yml pada cabang v1; job dari workflow lain — termasuk workflow ini,
+# di repo yang sama — harus ditolak.
+#
+# Dijalankan dengan tangan (Actions → Probe → Run workflow), terutama sesudah
+# platform diperbarui atau daftar workflow yang dipercayanya diubah. Job ini
+# LULUS bila platform MENOLAK. Tidak ada image yang dibangun dan tidak ada
+# rilis yang didaftarkan: yang dikirim hanya satu pertanyaan tentang rilis yang
+# tidak ada.
+
+name: Probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      api_url:
+        description: Alamat API GONSU yang diuji.
+        required: false
+        type: string
+        default: https://api.gonsu.cloud
+
+permissions: {}
+
+jobs:
+  rejected:
+    name: Workflow lain harus ditolak
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      # Untuk meminta bukti asal job dari GitHub — bukti yang SAH, dari repo
+      # yang dipercaya platform, tetapi bukan dari pipeline rilisnya.
+      id-token: write
+    steps:
+      - name: Meminta bukti lalu bertanya ke platform
+        shell: python
+        env:
+          API_URL: ${{ inputs.api_url }}
+        run: |
+          import json
+          import os
+          import re
+          import sys
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          env = os.environ
+          api = env["API_URL"].rstrip("/")
+          if not re.fullmatch(r"https://[a-z0-9]+([.-][a-z0-9]+)*(:[0-9]+)?", api):
+              print("::error::Masukan api_url tidak sah: " + api)
+              sys.exit(1)
+
+          request = urllib.request.Request(
+              env["ACTIONS_ID_TOKEN_REQUEST_URL"] + "&audience=" + urllib.parse.quote("gonsu-release", safe=""),
+              headers={"Authorization": "bearer " + env["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]})
+          with urllib.request.urlopen(request, timeout=30) as response:
+              token = json.load(response)["value"]
+          print("::add-mask::" + token, flush=True)
+
+          # Rilis yang tidak ada. Platform yang MENERIMA bukti ini menjawab 404
+          # (rilis tidak ditemukan); platform yang menolaknya menjawab 403
+          # sebelum melihat rilis mana yang ditanyakan.
+          request = urllib.request.Request(
+              api + "/internal/v1/releases/rel_00000000000000000000000000",
+              headers={"Authorization": "Bearer " + token, "User-Agent": "gonsu-release-probe"})
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  status, text = response.status, response.read().decode("utf-8", "replace")
+          except urllib.error.HTTPError as error:
+              status, text = error.code, error.read().decode("utf-8", "replace")
+
+          try:
+              message = (json.loads(text).get("error") or {}).get("message", "")
+          except ValueError:
+              message = text[:300]
+          print("Jawaban platform: %s %s" % (status, message))
+
+          if status == 403 and "pipeline rilis milik platform" in message:
+              print("Lulus: platform menolak bukti dari workflow yang bukan pipeline rilisnya.")
+              sys.exit(0)
+          if status == 404:
+              print("::error::Platform MENERIMA bukti dari workflow ini. Daftar workflow yang dipercaya "
+                    "tidak diberlakukan, atau memuat workflow ini.")
+              sys.exit(1)
+          print("::error::Jawaban tidak dikenali (%s). Yang diharapkan 403 yang menyebut pipeline rilis milik platform." % status)
+          sys.exit(1)
